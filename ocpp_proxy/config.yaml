@@ -1,7 +1,7 @@
 name: OCPP Proxy
 version: "1.0.0"
 slug: ocpp_proxy
-description: Zit tussen een OCPP 1.6J-laadpaal en de backend (bijv. Vattenfall) en maakt er sensoren van in Home Assistant
+description: Sits between an OCPP 1.6J charger and its backend (e.g. Vattenfall) and turns the traffic into Home Assistant sensors
 url: https://github.com/bart7782/ha-ocpp-proxy
 arch:
   - amd64
@@ -14,7 +14,7 @@ homeassistant_api: true
 ports:
   9000/tcp: 9000
 ports_description:
-  9000/tcp: Hier verbindt de laadpaal mee (ws://<HA-ip>:9000/<pad van de backend>/)
+  9000/tcp: The charger connects here (ws://<HA-ip>:9000/<backend path>/)
 options:
   upstream: ws://ocpp.e-flux.nl
   tags: []
