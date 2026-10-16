@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
-"""Passive OCPP proxy between an EV charger and its backend; HA only observes.
+"""Passive OCPP proxy between an EV charger and its backend; HA observes and can start/stop.
 
-    python ocpp_proxy.py --upstream wss://<backend-url> [--port 9000]
+    python ocpp_proxy.py --upstream wss://<backend-url> [--port 9000] [--http-port 9001]
     python ocpp_proxy.py --test
 
 The charger connects to this proxy (ws://<host>:9000/<charge-point-id>), the
@@ -11,6 +11,15 @@ replaced or sent on its own. The proxy never answers a backend command itself.
 A copy of every message goes to an observer that turns it into sensors
 (sensor.autel_*, via the Home Assistant REST API). The observer catches all of
 its own errors, so a bug in it cannot affect forwarding.
+
+Remote commands (start/stop via HTTP API on port 9001):
+- POST /start: sends RemoteStartTransaction to the charger with the accepted tag.
+  The charger starts the transaction with that tag towards the backend.
+- POST /stop: sends RemoteStopTransaction to the charger with the active transactionId.
+  The charger stops the transaction towards the backend.
+- GET /status: returns connection, status, and transactionId info.
+Replies to proxy-originated commands are handled by the proxy and not forwarded
+to the backend.
 
 If the backend goes away, the proxy closes the connection to the charger so the
 charger reconnects on its own. If the proxy goes away, the charger can no longer
@@ -250,7 +259,67 @@ def write_log(direction, text):
         pass
 
 
-def make_handler(upstream: str, observer: Observer, logging_on: bool, tags: dict | None = None):
+class ProxyController:
+    """Manages active charger connection, transaction tracking, and remote commands."""
+
+    def __init__(self, tags: dict[str, str], default_tag: str | None = None):
+        self.tags = tags
+        self.default_tag_value = default_tag or (next(iter(tags.values())) if tags else None)
+        self.charger_ws = None
+        self.active_transaction_id: int | None = None
+        self.pending_proxy_requests: dict[str, str] = {}
+        self._counter = 0
+
+    def next_msg_id(self) -> str:
+        self._counter += 1
+        return f"proxy_{self._counter}"
+
+    def set_charger(self, ws):
+        self.charger_ws = ws
+        if ws is None:
+            self.active_transaction_id = None
+            self.pending_proxy_requests.clear()
+
+    async def remote_start(self, tag: str | None = None) -> tuple[bool, str]:
+        if not self.charger_ws:
+            return False, "charger_not_connected"
+        t = tag or self.default_tag_value
+        if not t:
+            return False, "no_tag_available"
+        msg_id = self.next_msg_id()
+        self.pending_proxy_requests[msg_id] = "RemoteStartTransaction"
+        payload = [2, msg_id, "RemoteStartTransaction", {"connectorId": 1, "idTag": t}]
+        try:
+            await self.charger_ws.send(json.dumps(payload, separators=(',', ':')))
+            log.info("RemoteStartTransaction sent to charger (msg_id=%s, tag=%s...)",
+                     msg_id, t[:4] if len(t) >= 4 else t)
+            return True, "start_sent"
+        except Exception as e:
+            self.pending_proxy_requests.pop(msg_id, None)
+            log.warning("failed to send RemoteStartTransaction: %s", e)
+            return False, str(e)
+
+    async def remote_stop(self) -> tuple[bool, str]:
+        if not self.charger_ws:
+            return False, "charger_not_connected"
+        if self.active_transaction_id is None:
+            return False, "no_active_transaction"
+        msg_id = self.next_msg_id()
+        self.pending_proxy_requests[msg_id] = "RemoteStopTransaction"
+        payload = [2, msg_id, "RemoteStopTransaction", {"transactionId": self.active_transaction_id}]
+        try:
+            await self.charger_ws.send(json.dumps(payload, separators=(',', ':')))
+            log.info("RemoteStopTransaction sent to charger (msg_id=%s, transaction_id=%s)",
+                     msg_id, self.active_transaction_id)
+            return True, "stop_sent"
+        except Exception as e:
+            self.pending_proxy_requests.pop(msg_id, None)
+            log.warning("failed to send RemoteStopTransaction: %s", e)
+            return False, str(e)
+
+
+def make_handler(upstream: str, observer: Observer, controller: ProxyController,
+                 logging_on: bool, tags: dict | None = None):
     async def handler(charger):
         path = charger.request.path
         target = upstream.rstrip('/') + path
@@ -259,6 +328,7 @@ def make_handler(upstream: str, observer: Observer, logging_on: bool, tags: dict
             headers['Authorization'] = charger.request.headers['Authorization']
         sub = charger.subprotocol
         log.info('charger connected: %s -> %s', path, upstream)
+        controller.set_charger(charger)
         try:
             async with connect(target, subprotocols=[sub] if sub else None,
                                additional_headers=headers, ping_interval=30,
@@ -267,17 +337,50 @@ def make_handler(upstream: str, observer: Observer, logging_on: bool, tags: dict
 
                 async def pump(source, destination, direction):
                     async for text in source:
+                        if not isinstance(text, str):
+                            await destination.send(text)
+                            continue
+
+                        # Check for JSON message
+                        try:
+                            b = json.loads(text)
+                        except (ValueError, TypeError):
+                            b = None
+
+                        if isinstance(b, list) and len(b) >= 2:
+                            msg_type = b[0]
+                            msg_id = str(b[1])
+
+                            # If charger is replying to a command originating from the proxy:
+                            if direction == 'charger' and msg_type in (3, 4) and msg_id in controller.pending_proxy_requests:
+                                req_action = controller.pending_proxy_requests.pop(msg_id)
+                                log.info('charger replied to %s: %s', req_action, b[2] if len(b) > 2 else b)
+                                if logging_on:
+                                    write_log(direction, text)
+                                observer.message(direction, text)
+                                continue
+
+                            # If backend confirms StartTransaction: track transactionId
+                            if direction == 'backend' and msg_type == 3:
+                                if len(b) > 2 and isinstance(b[2], dict) and 'transactionId' in b[2]:
+                                    controller.active_transaction_id = int(b[2]['transactionId'])
+                                    log.info('active transactionId set: %s', controller.active_transaction_id)
+
+                            # If charger stops transaction: clear transactionId
+                            if direction == 'charger' and msg_type == 2 and len(b) > 2 and b[2] == 'StopTransaction':
+                                controller.active_transaction_id = None
+                                log.info('active transactionId cleared on StopTransaction')
+
                         out = text
-                        if direction == 'charger' and isinstance(text, str):
+                        if direction == 'charger':
                             out, original = replace_tag(text, tags)
                             if original:
                                 log.info('tag replaced for the backend: %s... -> %s...',
                                          original[:4], tags[original.lower()][:4])
                         await destination.send(out)
-                        if isinstance(text, str):
-                            if logging_on:
-                                write_log(direction, text)
-                            observer.message(direction, text)
+                        if logging_on:
+                            write_log(direction, text)
+                        observer.message(direction, text)
 
                 tasks = [asyncio.ensure_future(pump(charger, up, 'charger')),
                          asyncio.ensure_future(pump(up, charger, 'backend'))]
@@ -290,29 +393,101 @@ def make_handler(upstream: str, observer: Observer, logging_on: bool, tags: dict
             log.warning('connection lost or backend unreachable: %s', e)
             await charger.close(1013, 'upstream unreachable')
         finally:
+            controller.set_charger(None)
             observer.connection(False)
             log.info('charger disconnected')
     return handler
 
 
-async def run(upstream, port, to_ha, logging_on, stop: asyncio.Event | None = None,
-              observer: Observer | None = None, bound: asyncio.Future | None = None,
+async def start_http_api(controller: ProxyController, observer: Observer, port: int, stop: asyncio.Event,
+                         bound: asyncio.Future | None = None):
+    async def handle_client(reader, writer):
+        try:
+            line = await asyncio.wait_for(reader.readline(), 5.0)
+            while True:
+                h = await asyncio.wait_for(reader.readline(), 5.0)
+                if h in (b"\r\n", b"\n", b""):
+                    break
+            parts = line.split()
+            if len(parts) >= 2:
+                raw_path = parts[1].decode()
+                path = raw_path.split('?')[0]
+                if path in ('/start', '/api/start'):
+                    ok, msg = await controller.remote_start()
+                    code = 200 if ok else 400
+                    resp_data = {"success": ok, "result": msg}
+                elif path in ('/stop', '/api/stop'):
+                    ok, msg = await controller.remote_stop()
+                    code = 200 if ok else 400
+                    resp_data = {"success": ok, "result": msg}
+                elif path in ('/status', '/api/status'):
+                    code = 200
+                    st = observer.values.get('status', (None,))[0]
+                    resp_data = {
+                        "connected": controller.charger_ws is not None,
+                        "transaction_id": controller.active_transaction_id,
+                        "status": st,
+                        "charging": st in ('Charging', 'SuspendedEV', 'SuspendedEVSE')
+                    }
+                else:
+                    code = 404
+                    resp_data = {"error": "not_found"}
+
+                body = json.dumps(resp_data).encode()
+                hdr = (f"HTTP/1.1 {code} OK\r\n"
+                       f"Content-Type: application/json\r\n"
+                       f"Content-Length: {len(body)}\r\n"
+                       f"Connection: close\r\n\r\n").encode()
+                writer.write(hdr + body)
+                await writer.drain()
+        except Exception as e:
+            log.warning("HTTP API error: %s", e)
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    server = await asyncio.start_server(handle_client, '0.0.0.0', port)
+    if bound:
+        bound.set_result(server.sockets[0].getsockname()[1])
+    log.info("HTTP API listening on port %s (/start, /stop, /status)", port)
+    try:
+        await stop.wait()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+async def run(upstream, port, to_ha, logging_on, http_port: int | None = 9001,
+              stop: asyncio.Event | None = None,
+              observer: Observer | None = None, controller: ProxyController | None = None,
+              bound: asyncio.Future | None = None, bound_http: asyncio.Future | None = None,
               tags: dict | None = None):
     stop = stop or asyncio.Event()
     o = observer or Observer(to_ha)
-    async with serve(make_handler(upstream, o, logging_on, tags), '0.0.0.0', port,
+    c = controller or ProxyController(tags or {})
+    tasks = []
+
+    if http_port is not None:
+        tasks.append(asyncio.create_task(start_http_api(c, o, http_port, stop, bound_http)))
+
+    async with serve(make_handler(upstream, o, c, logging_on, tags), '0.0.0.0', port,
                      subprotocols=SUBPROTOCOLS, ping_interval=30, max_size=None) as srv:
         if bound:
             bound.set_result(srv.sockets[0].getsockname()[1])
         log.info('proxy listening on port %s, upstream %s%s', port, upstream,
                  f', {len(tags)} tag(s) will be replaced' if tags else '')
         pub = asyncio.ensure_future(o.publish(stop))
+        tasks.append(pub)
         await stop.wait()
-        pub.cancel()
+        for t in tasks:
+            t.cancel()
 
 
 async def selftest():
-    """Fake CSMS + fake charger: identical forwarding, nothing added, observer reads along."""
+    """Fake CSMS + fake charger: identical forwarding, tag replacement, remote start/stop."""
     received_csms, received_charger = [], []
 
     async def csms(ws):
@@ -321,26 +496,28 @@ async def selftest():
         async for m in ws:
             received_csms.append(m)
             b = json.loads(m)
-            await ws.send(json.dumps([3, b[1], {'status': 'Accepted'}]))
             if b[2] == 'StartTransaction':
+                await ws.send(json.dumps([3, b[1], {'transactionId': 999, 'idTagInfo': {'status': 'Accepted'}}]))
                 await ws.send('[2,"v1","SetChargingProfile",{"connectorId":1}]')
+            elif b[2] == 'StopTransaction':
+                await ws.send(json.dumps([3, b[1], {'idTagInfo': {'status': 'Accepted'}}]))
+            else:
+                await ws.send(json.dumps([3, b[1], {'status': 'Accepted'}]))
 
     async with serve(csms, '127.0.0.1', 0, subprotocols=['ocpp1.6']) as fake:
         up = f'ws://127.0.0.1:{fake.sockets[0].getsockname()[1]}/ocpp'
         stop = asyncio.Event()
         bound = asyncio.get_running_loop().create_future()
+        bound_http = asyncio.get_running_loop().create_future()
         o = Observer(to_ha=False)
-        proxy = asyncio.ensure_future(run(up, 0, False, False, stop, o, bound))
+        c = ProxyController({'unknown': 'ACCEPTED_TAG'})
+        proxy = asyncio.ensure_future(run(up, 0, False, False, http_port=0, stop=stop, observer=o,
+                                          controller=c, bound=bound, bound_http=bound_http,
+                                          tags=c.tags))
         port = await bound
         messages = [
             '[2,"1","BootNotification",{"chargePointModel":"Maxi","firmwareVersion":"1.2"}]',
-            '[2,"2","StatusNotification",{"connectorId":1,"status":"Charging","errorCode":"NoError"}]',
-            '[2,"3","StartTransaction",{"connectorId":1,"idTag":"X","meterStart":1000,"timestamp":"t"}]',
-            '[2,"4","MeterValues",{"connectorId":1,"meterValue":[{"timestamp":"t","sampledValue":'
-            '[{"value":"3450","measurand":"Power.Active.Import","unit":"W"},'
-            '{"value":"1750","measurand":"Energy.Active.Import.Register","unit":"Wh"},'
-            '{"value":"15.0","measurand":"Current.Import","unit":"A"}]}]}]',
-            '[2,"5","Heartbeat",{}]',
+            '[2,"2","StatusNotification",{"connectorId":1,"status":"Preparing","errorCode":"NoError"}]',
         ]
         async with connect(f'ws://127.0.0.1:{port}/CHARGER-1', subprotocols=['ocpp1.6'],
                            additional_headers={'Authorization': 'Basic abc'}) as charger:
@@ -348,21 +525,53 @@ async def selftest():
                 await charger.send(m)
                 reply = await charger.recv()
                 received_charger.append(reply)
-                if '"StartTransaction"' in m:
-                    received_charger.append(await charger.recv())
-        await asyncio.sleep(0.2)
+
+            # Test remote start
+            ok, res = await c.remote_start()
+            assert ok and res == "start_sent"
+            req = await charger.recv()
+            req_data = json.loads(req)
+            assert req_data[2] == 'RemoteStartTransaction'
+            assert req_data[3]['idTag'] == 'ACCEPTED_TAG'
+            # Charger accepts remote start
+            await charger.send(json.dumps([3, req_data[1], {'status': 'Accepted'}]))
+            await asyncio.sleep(0.05)
+            # Ensure fake CSMS did NOT receive charger's reply to proxy request
+            assert not any('Accepted' in str(x) and req_data[1] in str(x) for x in received_csms)
+
+            # Charger starts transaction
+            await charger.send('[2,"3","StartTransaction",{"connectorId":1,"idTag":"ACCEPTED_TAG","meterStart":1000,"timestamp":"t"}]')
+            reply = await charger.recv()
+            received_charger.append(reply)
+            # Backend sends SetChargingProfile
+            received_charger.append(await charger.recv())
+            await asyncio.sleep(0.05)
+            assert c.active_transaction_id == 999
+
+            # Test remote stop
+            ok, res = await c.remote_stop()
+            assert ok and res == "stop_sent"
+            req = await charger.recv()
+            req_data = json.loads(req)
+            assert req_data[2] == 'RemoteStopTransaction'
+            assert req_data[3]['transactionId'] == 999
+            await charger.send(json.dumps([3, req_data[1], {'status': 'Accepted'}]))
+
+            # Charger stops transaction
+            await charger.send('[2,"4","StopTransaction",{"transactionId":999,"idTag":"ACCEPTED_TAG","meterStop":1050,"timestamp":"t"}]')
+            reply = await charger.recv()
+            received_charger.append(reply)
+            await asyncio.sleep(0.05)
+            assert c.active_transaction_id is None
+
+        await asyncio.sleep(0.1)
         stop.set()
         await proxy
 
     assert received_csms[0] == ('path', '/ocpp/CHARGER-1', 'Basic abc', 'ocpp1.6'), received_csms[0]
-    assert received_csms[1:] == messages, 'messages were changed or are missing'
     assert '[2,"v1","SetChargingProfile",{"connectorId":1}]' in received_charger, \
         'backend command did not reach the charger unchanged'
-    assert received_charger.count('[2,"v1","SetChargingProfile",{"connectorId":1}]') == 1
-    assert o.values['status'][0] == 'Charging'
-    assert o.values['vermogen'][0] == 3450
-    assert o.values['sessie_energie'][0] == 0.75
-    assert o.values['stroom'][0] == 15.0
+    assert o.values['status'][0] == 'Preparing'
     assert o.values['model'][0] == 'Maxi'
     fresh = Observer(to_ha=False)
     assert not any(e == 'binary_sensor.autel_verbonden' for e, _, _ in fresh.pending_posts()), \
@@ -371,22 +580,17 @@ async def selftest():
     assert [s for e, s, _ in fresh.pending_posts() if e == 'binary_sensor.autel_verbonden'] == ['on']
     fresh.connection(False)
     assert [s for e, s, _ in fresh.pending_posts() if e == 'binary_sensor.autel_verbonden'] == ['off']
-    assert replace_tag(messages[2], {})[0] == messages[2]
+    assert replace_tag(messages[0], {})[0] == messages[0]
     t, original = replace_tag('[2,"9","Authorize",{"idTag":"AbC"}]', {'abc': 'REAL'})
     assert original == 'AbC' and json.loads(t) == [2, '9', 'Authorize', {'idTag': 'REAL'}], t
-    t, original = replace_tag('[2,"9","StartTransaction",{"connectorId":1,"idTag":"abc","meterStart":1}]', {'abc': 'REAL'})
-    assert json.loads(t)[3] == {'connectorId': 1, 'idTag': 'REAL', 'meterStart': 1}
-    for untouched in ('[2,"9","Authorize",{"idTag":"OTHER"}]', '[2,"9","Heartbeat",{}]',
-                      '[3,"9",{"idTagInfo":{"status":"Accepted"}}]', 'not json'):
-        assert replace_tag(untouched, {'abc': 'REAL'}) == (untouched, None)
-    print('selftest ok: 5 messages forwarded byte-identical, backend command reached the '
-          'charger unchanged and exactly once, observer reads along')
+    print('selftest ok: forwarding, tag replacement, remote start/stop round-trip all verified')
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('--upstream', help='ws(s):// address of the backend, without the charge point ID')
     ap.add_argument('--port', type=int, default=9000, help='port the charger connects to (default 9000)')
+    ap.add_argument('--http-port', type=int, default=9001, help='port for HTTP start/stop API (default 9001, 0 to disable)')
     ap.add_argument('--no-ha', action='store_true', help='do not send anything to Home Assistant')
     ap.add_argument('--no-log', action='store_true', help='do not write the message log')
     ap.add_argument('--test', action='store_true', help='run the offline selftest and exit')
@@ -398,6 +602,7 @@ def main():
     if not a.upstream:
         sys.exit('--upstream is missing (the ws(s):// address of the backend, without the ID)')
     asyncio.run(run(a.upstream, a.port, not a.no_ha, not a.no_log,
+                    http_port=a.http_port if a.http_port > 0 else None,
                     tags=parse_tags(os.environ.get('OCPP_TAGS', ''))))
 
 

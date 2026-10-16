@@ -1,5 +1,5 @@
 name: OCPP Proxy
-version: "1.0.1"
+version: "1.1.0"
 slug: ocpp_proxy
 description: Sits between an OCPP 1.6J charger and its backend (e.g. Vattenfall) and turns the traffic into Home Assistant sensors
 url: https://github.com/bart7782/ha-ocpp-proxy
@@ -13,8 +13,10 @@ watchdog: tcp://[HOST]:[PORT:9000]
 homeassistant_api: true
 ports:
   9000/tcp: 9000
+  9001/tcp: 9001
 ports_description:
   9000/tcp: The charger connects here (ws://<HA-ip>:9000/<backend path>/)
+  9001/tcp: HTTP API for start/stop (http://<HA-ip>:9001/start, /stop, /status)
 options:
   upstream: ws://ocpp.e-flux.nl
   tags: []

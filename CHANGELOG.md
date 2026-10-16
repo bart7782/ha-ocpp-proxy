@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.1.0
+
+- Remote start and stop: the proxy now exposes a local HTTP API on port 9001
+  (`/start`, `/stop`, `/status`).
+- `/start` sends `RemoteStartTransaction` to the charger with the configured
+  backend tag, starting a standard session towards the backend.
+- `/stop` sends `RemoteStopTransaction` with the active transaction ID.
+- Replies to proxy-originated commands are handled internally and not forwarded
+  to the backend.
+
 ## 1.0.1
 
 - Fix: `binary_sensor.autel_verbonden` is no longer set to `off` at startup. The
