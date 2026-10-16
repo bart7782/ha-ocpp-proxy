@@ -1,5 +1,5 @@
 name: OCPP Proxy
-version: "1.0.0"
+version: "1.0.1"
 slug: ocpp_proxy
 description: Sits between an OCPP 1.6J charger and its backend (e.g. Vattenfall) and turns the traffic into Home Assistant sensors
 url: https://github.com/bart7782/ha-ocpp-proxy

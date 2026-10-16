@@ -113,6 +113,9 @@ class Observer:
         self.last_post: dict[str, tuple] = {}
         self.session_start_wh: float | None = None
         self.connected = False
+        # Until a charger has connected to this process, the connected state is
+        # not ours to publish: another proxy instance may own the charger.
+        self.ever_connected = False
 
     def message(self, direction: str, text: str):
         try:
@@ -180,12 +183,14 @@ class Observer:
 
     def connection(self, up: bool):
         self.connected = up
+        if up:
+            self.ever_connected = True
 
     def pending_posts(self) -> list[tuple[str, object, dict]]:
         """The states that changed since the last call, as (entity_id, state, attributes)."""
         posts = []
         state = ('on' if self.connected else 'off',)
-        if self.last_post.get('_connected') != state:
+        if self.ever_connected and self.last_post.get('_connected') != state:
             self.last_post['_connected'] = state
             posts.append(('binary_sensor.autel_verbonden', state[0],
                           {'friendly_name': 'Autel connected to proxy',
@@ -359,6 +364,13 @@ async def selftest():
     assert o.values['sessie_energie'][0] == 0.75
     assert o.values['stroom'][0] == 15.0
     assert o.values['model'][0] == 'Maxi'
+    fresh = Observer(to_ha=False)
+    assert not any(e == 'binary_sensor.autel_verbonden' for e, _, _ in fresh.pending_posts()), \
+        'connected state published before any charger connected'
+    fresh.connection(True)
+    assert [s for e, s, _ in fresh.pending_posts() if e == 'binary_sensor.autel_verbonden'] == ['on']
+    fresh.connection(False)
+    assert [s for e, s, _ in fresh.pending_posts() if e == 'binary_sensor.autel_verbonden'] == ['off']
     assert replace_tag(messages[2], {})[0] == messages[2]
     t, original = replace_tag('[2,"9","Authorize",{"idTag":"AbC"}]', {'abc': 'REAL'})
     assert original == 'AbC' and json.loads(t) == [2, '9', 'Authorize', {'idTag': 'REAL'}], t
