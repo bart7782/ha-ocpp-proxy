@@ -262,13 +262,17 @@ def write_log(direction, text):
 class ProxyController:
     """Manages active charger connection, transaction tracking, and remote commands."""
 
-    def __init__(self, tags: dict[str, str], default_tag: str | None = None):
+    def __init__(self, tags: dict[str, str], default_tag: str | None = None,
+                 observer: Observer | None = None, cooldown_seconds: float = 10.0):
         self.tags = tags
         self.default_tag_value = default_tag or (next(iter(tags.values())) if tags else None)
         self.charger_ws = None
         self.active_transaction_id: int | None = None
         self.pending_proxy_requests: dict[str, str] = {}
         self._counter = 0
+        self.observer = observer
+        self.cooldown_seconds = cooldown_seconds
+        self.last_command_time: float = 0.0
 
     def next_msg_id(self) -> str:
         self._counter += 1
@@ -281,11 +285,24 @@ class ProxyController:
             self.pending_proxy_requests.clear()
 
     async def remote_start(self, tag: str | None = None) -> tuple[bool, str]:
+        now = time.monotonic()
+        if now - self.last_command_time < self.cooldown_seconds:
+            remaining = round(self.cooldown_seconds - (now - self.last_command_time), 1)
+            return False, f"cooldown_active_{remaining}s"
+
         if not self.charger_ws:
             return False, "charger_not_connected"
+
+        # Check if already charging or active transaction
+        st = self.observer.values.get('status', (None,))[0] if self.observer else None
+        if self.active_transaction_id is not None or st in ('Charging',):
+            return False, "already_charging"
+
         t = tag or self.default_tag_value
         if not t:
             return False, "no_tag_available"
+
+        self.last_command_time = now
         msg_id = self.next_msg_id()
         self.pending_proxy_requests[msg_id] = "RemoteStartTransaction"
         payload = [2, msg_id, "RemoteStartTransaction", {"connectorId": 1, "idTag": t}]
@@ -300,17 +317,33 @@ class ProxyController:
             return False, str(e)
 
     async def remote_stop(self) -> tuple[bool, str]:
+        now = time.monotonic()
+        if now - self.last_command_time < self.cooldown_seconds:
+            remaining = round(self.cooldown_seconds - (now - self.last_command_time), 1)
+            return False, f"cooldown_active_{remaining}s"
+
         if not self.charger_ws:
             return False, "charger_not_connected"
-        if self.active_transaction_id is None:
+
+        st = self.observer.values.get('status', (None,))[0] if self.observer else None
+        tx_id = self.active_transaction_id
+
+        # If charger is completely available/faulted/offline and no transaction active:
+        if tx_id is None and st not in ('Charging', 'SuspendedEV', 'SuspendedEVSE'):
             return False, "no_active_transaction"
+
+        # Fallback transaction ID if charger is suspended/charging but transaction ID not recorded
+        if tx_id is None:
+            tx_id = 1
+
+        self.last_command_time = now
         msg_id = self.next_msg_id()
         self.pending_proxy_requests[msg_id] = "RemoteStopTransaction"
-        payload = [2, msg_id, "RemoteStopTransaction", {"transactionId": self.active_transaction_id}]
+        payload = [2, msg_id, "RemoteStopTransaction", {"transactionId": tx_id}]
         try:
             await self.charger_ws.send(json.dumps(payload, separators=(',', ':')))
             log.info("RemoteStopTransaction sent to charger (msg_id=%s, transaction_id=%s)",
-                     msg_id, self.active_transaction_id)
+                     msg_id, tx_id)
             return True, "stop_sent"
         except Exception as e:
             self.pending_proxy_requests.pop(msg_id, None)
@@ -414,11 +447,11 @@ async def start_http_api(controller: ProxyController, observer: Observer, port: 
                 path = raw_path.split('?')[0]
                 if path in ('/start', '/api/start'):
                     ok, msg = await controller.remote_start()
-                    code = 200 if ok else 400
+                    code = 200 if ok else (429 if 'cooldown' in msg else 400)
                     resp_data = {"success": ok, "result": msg}
                 elif path in ('/stop', '/api/stop'):
                     ok, msg = await controller.remote_stop()
-                    code = 200 if ok else 400
+                    code = 200 if ok else (429 if 'cooldown' in msg else 400)
                     resp_data = {"success": ok, "result": msg}
                 elif path in ('/status', '/api/status'):
                     code = 200
@@ -467,7 +500,7 @@ async def run(upstream, port, to_ha, logging_on, http_port: int | None = 9001,
               tags: dict | None = None):
     stop = stop or asyncio.Event()
     o = observer or Observer(to_ha)
-    c = controller or ProxyController(tags or {})
+    c = controller or ProxyController(tags or {}, observer=o)
     tasks = []
 
     if http_port is not None:
@@ -510,7 +543,7 @@ async def selftest():
         bound = asyncio.get_running_loop().create_future()
         bound_http = asyncio.get_running_loop().create_future()
         o = Observer(to_ha=False)
-        c = ProxyController({'unknown': 'ACCEPTED_TAG'})
+        c = ProxyController({'unknown': 'ACCEPTED_TAG'}, observer=o, cooldown_seconds=0.0)
         proxy = asyncio.ensure_future(run(up, 0, False, False, http_port=0, stop=stop, observer=o,
                                           controller=c, bound=bound, bound_http=bound_http,
                                           tags=c.tags))
@@ -548,6 +581,10 @@ async def selftest():
             await asyncio.sleep(0.05)
             assert c.active_transaction_id == 999
 
+            # Remote start while already in active transaction should be rejected
+            ok_again, err_again = await c.remote_start()
+            assert not ok_again and err_again == "already_charging"
+
             # Test remote stop
             ok, res = await c.remote_stop()
             assert ok and res == "stop_sent"
@@ -563,6 +600,19 @@ async def selftest():
             received_charger.append(reply)
             await asyncio.sleep(0.05)
             assert c.active_transaction_id is None
+
+            # Remote stop when no transaction is active and status is not charging
+            ok_stop2, err_stop2 = await c.remote_stop()
+            assert not ok_stop2 and err_stop2 == "no_active_transaction"
+
+            # Test cooldown behavior
+            c_cool = ProxyController({'unknown': 'ACCEPTED_TAG'}, observer=o, cooldown_seconds=10.0)
+            c_cool.charger_ws = charger
+            ok_c1, _ = await c_cool.remote_start()
+            ok_c2, res_c2 = await c_cool.remote_start()
+            assert not ok_c2 and "cooldown_active" in res_c2
+            # Drain the RemoteStart from c_cool
+            await charger.recv()
 
         await asyncio.sleep(0.1)
         stop.set()

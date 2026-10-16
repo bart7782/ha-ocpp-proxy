@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.2.0
+
+- Debounce & protection: 10-second cooldown between start and stop commands to
+  protect hardware and prevent rapid session creation on the backend.
+- State checks: `/start` rejects if a session is already active or charging;
+  `/stop` rejects if the charger is not in an active session.
+
 ## 1.1.0
 
 - Remote start and stop: the proxy now exposes a local HTTP API on port 9001
