@@ -145,7 +145,8 @@ From real experience with an Autel MaxiCharger AC (EC22SC01):
   Supervisor access does not work, fill in `ha_url` and `ha_token`. The connected
   sensor only appears once a charger has connected since the add-on started.
 - **Sensors are `unknown` after an HA restart.** States posted through the REST API are
-  not restored by HA; they return with the next message from the charger.
+  not restored by HA, and the proxy only re-posts a value when it changes. Restart the
+  add-on to publish everything again.
 
 ## Development
 
